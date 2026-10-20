@@ -43,11 +43,21 @@ llm:
       temperature: 0.0
       max_tokens: 2000
 
+
 database:
-  provider: "postgresql"
-  url_env: "DATABASE_URL"
-  pool_size: 5
-  max_overflow: 10
+  provider: "sqlite"
+  url: "sqlite:///data/commodity_finance.db"
+  echo: false
+
+memory:
+  provider: "local"
+  conversation:
+    enabled: true
+    max_messages: 20
+  persistence:
+    enabled: true
+    store: "sqlite"
+
 
 retrieval:
   embedding_model: "text-embedding-3-small"

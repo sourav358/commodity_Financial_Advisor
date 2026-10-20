@@ -35,3 +35,8 @@ Thumbs.db
 # Logs
 *.log
 '@ | Set-Content -Encoding utf8 .gitignore
+# Local databases and data
+data/
+*.db
+*.sqlite
+*.sqlite3
