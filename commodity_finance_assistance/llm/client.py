@@ -1,6 +1,8 @@
+
 import os
 from functools import lru_cache
 
+from dotenv import load_dotenv
 from openai import OpenAI
 
 from commodity_finance_assistance.config_loader import load_config
@@ -9,6 +11,8 @@ from commodity_finance_assistance.config_loader import load_config
 @lru_cache(maxsize=1)
 def get_openai_client() -> OpenAI:
     """Create and cache the configured OpenAI client."""
+    load_dotenv()
+
     config = load_config()
     providers = config.get("llm", {}).get("providers", {})
     provider_name = config.get("llm", {}).get(

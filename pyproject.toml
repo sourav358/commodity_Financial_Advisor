@@ -8,10 +8,20 @@ authors = [
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "openai (>=3.35.1,<4.0.0)",
-    "pyyaml (>=6.0.3,<7.0.0)"
+    "pyyaml (>=6.0.3,<7.0.0)",
+    "python-dotenv (>=1.2.4,<2.0.0)",
+    "pypdf (>=6.21.2,<7.0.0)",
+    "mcp (>=1.9,<2.0)"
 ]
 
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
 build-backend = "poetry.core.masonry.api"
+[project.scripts]
+commodity-finance = "commodity_finance_assistance.cli:main"
+[dependency-groups]
+dev = [
+    "pytest (>=9.1.1,<10.0.0)",
+    "pytest-asyncio (>=1.4.1,<2.0.0)"
+]

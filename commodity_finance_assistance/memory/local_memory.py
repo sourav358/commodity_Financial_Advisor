@@ -32,7 +32,11 @@ class LocalMemory:
 
         with get_connection() as connection:
             exists = connection.execute(
-                "SELECT 1 FROM conversations WHERE conversation_id = ?",
+                """
+                SELECT 1
+                FROM conversations
+                WHERE conversation_id = ?
+                """,
                 (conversation_id,),
             ).fetchone()
 
@@ -75,3 +79,66 @@ class LocalMemory:
             {"role": row["role"], "content": row["content"]}
             for row in rows
         ]
+
+    def list_conversations(
+        self,
+        limit: int = 20,
+    ) -> list[dict]:
+        """List conversations, most recently active first."""
+        if limit < 1:
+            raise ValueError("limit must be positive")
+
+        with get_connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    c.conversation_id,
+                    c.title,
+                    c.created_at,
+                    COUNT(m.id) AS message_count,
+                    MAX(m.created_at) AS last_message_at
+                FROM conversations AS c
+                LEFT JOIN messages AS m
+                    ON m.conversation_id = c.conversation_id
+                GROUP BY
+                    c.conversation_id,
+                    c.title,
+                    c.created_at
+                ORDER BY
+                    COALESCE(MAX(m.id), 0) DESC,
+                    c.created_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+
+        return [
+            {
+                "conversation_id": row["conversation_id"],
+                "title": row["title"],
+                "created_at": row["created_at"],
+                "message_count": row["message_count"],
+                "last_message_at": row["last_message_at"],
+            }
+            for row in rows
+        ]
+
+    def get_conversation(
+        self,
+        conversation_id: str,
+    ) -> dict | None:
+        """Get conversation details, or None if it doesn't exist."""
+        with get_connection() as connection:
+            row = connection.execute(
+                """
+                SELECT conversation_id, title, created_at
+                FROM conversations
+                WHERE conversation_id = ?
+                """,
+                (conversation_id,),
+            ).fetchone()
+
+        if row is None:
+            return None
+
+        return dict(row)

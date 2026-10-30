@@ -68,3 +68,29 @@ observability:
   enabled: true
   log_prompts: false
   log_responses: false
+mcp:
+  enabled: true
+
+  servers:
+    commodity:
+      transport: "stdio"
+      command: "poetry"
+      args:
+        - "run"
+        - "python"
+        - "-m"
+        - "commodity_finance_assistance.mcp.server"
+      timeout: 30
+ 
+  enabled: true
+
+  servers:
+    commodity:
+      transport: "stdio"
+      command: "poetry"
+      args:
+        - "run"
+        - "python"
+        - "-m"
+        - "commodity_finance_assistance.mcp.server"
+      timeout: 30

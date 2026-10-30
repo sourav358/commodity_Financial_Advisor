@@ -1,0 +1,65 @@
+
+contracts:
+  GOLD:
+    commodity: Gold
+    price_unit: INR per 10 grams
+    trading_unit: 1 kilogram
+    quoted_quantity_grams: 10
+    trading_quantity_grams: 1000
+    verified: false
+    source: ""
+    effective_date: ""
+    quoted_quantity: 10
+    quoted_quantity_unit: grams
+    trading_quantity: 1000
+    trading_quantity_unit: grams
+
+  GOLDM:
+    commodity: Gold Mini
+    price_unit: ""
+    trading_unit: ""
+    quoted_quantity_grams: null
+    trading_quantity_grams: null
+    verified: false
+    source: ""
+    effective_date: ""
+
+  GOLDGUINEA:
+    commodity: Gold Guinea
+    price_unit: ""
+    trading_unit: ""
+    quoted_quantity_grams: null
+    trading_quantity_grams: null
+    verified: false
+    source: ""
+    effective_date: ""
+
+  SILVER:
+    commodity: Silver
+    price_unit: ""
+    trading_unit: ""
+    quoted_quantity_grams: null
+    trading_quantity_grams: null
+    verified: false
+    source: ""
+    effective_date: ""
+
+  CRUDEOIL:
+    commodity: Crude Oil
+    price_unit: ""
+    trading_unit: ""
+    quoted_quantity_grams: null
+    trading_quantity_grams: null
+    verified: false
+    source: ""
+    effective_date: ""
+
+  NATURALGAS:
+    commodity: Natural Gas
+    price_unit: ""
+    trading_unit: ""
+    quoted_quantity_grams: null
+    trading_quantity_grams: null
+    verified: false
+    source: ""
+    effective_date: ""
