@@ -236,31 +236,7 @@ class SQLiteApprovalStore:
 
         finally:
             connection.close()
-        with self._connect() as connection:
-            connection.execute(
-                """INSERT INTO hitl_approval_requests (
-                    request_id, action_type, requester_id, reason, payload_json,
-                    payload_hash, status, created_at, expires_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    request.request_id,
-                    request.action_type,
-                    request.requester_id,
-                    request.reason,
-                    _canonical_json(request.payload),
-                    request.payload_hash,
-                    request.status.value,
-                    request.created_at,
-                    request.expires_at,
-                ),
-            )
-            connection.execute(
-                """INSERT INTO hitl_approval_events
-                   (request_id, event_type, actor_id, reason, event_at)
-                   VALUES (?, 'CREATED', ?, ?, ?)""",
-                (request.request_id, request.requester_id, request.reason, request.created_at),
-            )
-        return request
+         
 
     def get(self, request_id: str) -> ApprovalRequest:
         with self._connect() as connection:
