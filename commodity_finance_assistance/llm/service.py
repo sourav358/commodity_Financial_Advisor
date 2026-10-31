@@ -23,6 +23,22 @@ from commodity_finance_assistance.rag.context_formatter import (
     RAGContextFormatter,
 )
 from commodity_finance_assistance.skills.registry import SkillRegistry
+from commodity_finance_assistance.guardrails.engine import (
+    APPROVAL_TOOL,
+    GuardrailViolation,
+    validate_assistant_output,
+    validate_tool_call,
+    validate_user_input,
+)
+
+from commodity_finance_assistance.hitl.drafts import (
+    ApprovalDraftStore,
+    FIELD_LABELS,
+    REQUIRED_FIELDS,
+    missing_trade_fields,
+    parse_trade_fields,
+    validate_trade_fields,
+)
 
 
 logger = get_logger(__name__)
@@ -71,6 +87,7 @@ class LLMService:
         self.rag_top_k = rag_top_k
         self.rag_min_score = rag_min_score
         self.skill_registry = SkillRegistry()
+        self.approval_drafts = ApprovalDraftStore()
 
     def start_conversation(self, title: str = "") -> str:
         """Create a conversation and return its ID."""
@@ -129,6 +146,348 @@ class LLMService:
                 conversation_id,
             )
             return None
+    
+    @staticmethod
+    def _is_approval_request(message: str) -> bool:
+        text = message.casefold()
+
+        phrases = (
+            "request human approval",
+            "request approval",
+            "submit for approval",
+            "send for approval",
+            "for human approval",
+            "trade execution request",
+            "trade_execution_request",
+            "human review",
+        )
+
+        return any(phrase in text for phrase in phrases)
+
+    @staticmethod
+    def _is_confirmation(message: str) -> bool:
+        return message.strip().casefold() in {
+            "confirm",
+            "yes",
+            "yes, confirm",
+            "confirm submission",
+            "submit for approval",
+        }
+
+    @staticmethod
+    def _is_cancellation(message: str) -> bool:
+        return message.strip().casefold() in {
+            "cancel",
+            "cancel draft",
+            "discard draft",
+        }
+    @staticmethod
+    def _is_retry(message: str) -> bool:
+        return message.strip().casefold() in {
+            "retry",
+            "retry submission",
+            "retry approval submission",
+        }
+    @staticmethod
+    def _format_trade_proposal(fields: dict[str, Any]) -> str:
+        lines = [
+            "Please review the proposed trade details:",
+            "",
+        ]
+
+        for field in REQUIRED_FIELDS:
+            lines.append(
+                f"- {FIELD_LABELS[field]}: {fields.get(field, '')}"
+            )
+
+        lines.extend([
+            "",
+            "This is a proposal for human review only.",
+            "No trade has been executed.",
+            "",
+            "Reply CONFIRM to submit this proposal for human approval.",
+            "Reply CANCEL to discard this draft.",
+            "If a submission response is uncertain, reply RETRY SUBMISSION "
+            "to safely retry the same request.",
+        ])
+
+        return "\n".join(lines)
+
+    def _submit_approval_draft(
+        self,
+        conversation_id: str,
+        draft: dict[str, Any],
+    ) -> str:
+        """Submit a confirmed draft through the existing MCP approval tool."""
+        import asyncio
+        import json
+
+        from commodity_finance_assistance.mcp.client import (
+            connect_mcp_server,
+        )
+
+        fields = draft["fields"]
+
+        validate_trade_fields(fields)
+
+        payload = {
+            "commodity": fields["commodity"],
+            "instrument": fields["instrument"],
+            "direction": fields["direction"].upper(),
+            "quantity": fields["quantity"],
+            "unit": fields["unit"],
+            "price": fields["price"],
+            "trade_date": fields["trade_date"],
+            "delivery": fields["delivery"],
+            "exchange": fields["exchange"],
+            "counterparty": fields["counterparty"],
+            "legal_entity": fields["legal_entity"],
+            "book": fields["book"],
+            "portfolio": fields["portfolio"],
+            "conversation_id": conversation_id,
+        }
+
+        arguments = {
+            "action_type": "trade_execution_request",
+            "reason": (
+                "User explicitly confirmed this proposed trade "
+                "for human review."
+            ),
+            "payload_json": json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                allow_nan=False,
+            ),
+            "idempotency_key": draft["idempotency_key"],
+        }
+
+        # Apply the existing global and skill-level security checks.
+        validate_tool_call(
+            name=APPROVAL_TOOL,
+            arguments=arguments,
+            allowed_tools={APPROVAL_TOOL},
+        )
+
+        # Set this before contacting MCP. If the process crashes or the
+        # connection fails after submission, don't blindly submit twice.
+        self.approval_drafts.set_status(
+            conversation_id,
+            "submitting",
+        )
+
+        async def execute():
+            async with connect_mcp_server("commodity") as client:
+                return await client.execute_tool(
+                    name=APPROVAL_TOOL,
+                    arguments=arguments,
+                )
+
+        try:
+            result = asyncio.run(execute())
+        except Exception:
+            logger.exception(
+                "Approval submission outcome uncertain | conversation_id=%s",
+                conversation_id,
+            )
+            self.approval_drafts.set_status(
+                conversation_id,
+                "submission_uncertain",
+            )
+            return (
+                "The approval submission outcome could not be confirmed. "
+                "I have blocked automatic resubmission to avoid duplicate "
+                "requests. Check /approvals before attempting another "
+                "submission."
+            )
+
+        if not isinstance(result, str):
+            result = str(result)
+
+        try:
+            result_data = json.loads(result)
+        except json.JSONDecodeError:
+            self.approval_drafts.set_status(
+                conversation_id,
+                "submission_uncertain",
+            )
+            return (
+                "The MCP server returned an unrecognized response. "
+                "The submission outcome is uncertain. Check /approvals "
+                "before trying again."
+            )
+
+        if not isinstance(result_data, dict) or result_data.get("error"):
+            self.approval_drafts.set_status(
+                conversation_id,
+                "awaiting_confirmation",
+            )
+            return (
+                "The approval request was not created. "
+                "Please review the error and try again after resolving it.\n"
+                f"Details: {result_data}"
+            )
+
+        request_id = result_data.get("request_id")
+        status = result_data.get("status")
+
+        if not request_id or status != "PENDING":
+            self.approval_drafts.set_status(
+                conversation_id,
+                "submission_uncertain",
+            )
+            return (
+                "The MCP response did not confirm a PENDING approval "
+                "The outcome may be uncertain. You can safely send "
+                "RETRY SUBMISSION: the same idempotency key will be used, "
+                "so an existing request will not be duplicated.\n"
+                f"Details: {result_data}"
+            )
+
+        self.approval_drafts.set_status(
+            conversation_id,
+            "submitted",
+        )
+
+        logger.info(
+            "Approval draft submitted | conversation_id=%s | request_id=%s",
+            conversation_id,
+            request_id,
+        )
+
+        return (
+            "Your proposal has been submitted for human review.\n\n"
+            f"Approval request ID: {request_id}\n"
+            f"Status: {status}\n\n"
+            "No trade has been executed. A human reviewer must "
+            "approve or reject the request."
+        )
+
+    def _handle_approval_draft(
+        self,
+        conversation_id: str,
+        user_message: str,
+    ) -> str | None:
+        """Handle the deterministic multi-turn approval collection workflow."""
+        draft = self.approval_drafts.get(conversation_id)
+
+        if draft is None:
+            if not self._is_approval_request(user_message):
+                return None
+
+            self.approval_drafts.create(
+                conversation_id,
+                "trade_execution_request",
+            )
+            draft = self.approval_drafts.get(conversation_id)
+        if draft is not None and draft["status"] == "cancelled":
+            if not self._is_approval_request(user_message):
+                return None
+
+            self.approval_drafts.reset(
+                conversation_id,
+                "trade_execution_request",
+            )
+            draft = self.approval_drafts.get(conversation_id)
+
+        if draft is None:
+            raise RuntimeError("Could not initialize approval draft.")
+
+        status = draft["status"]
+
+        if status == "submitted":
+            return (
+                "This conversation already has a submitted approval request. "
+                "Use /approvals to review pending requests. Start a new "
+                "conversation if you need to prepare another proposal."
+            )
+
+        if status in {"submission_uncertain", "submitting"}:
+            if self._is_retry(user_message):
+                return self._submit_approval_draft(
+                    conversation_id,
+                    draft,
+                )
+
+            return (
+                "The previous approval submission has not been "
+                "confirmed. Send RETRY SUBMISSION to safely retry "
+                "using the same idempotency key. Do not start a "
+                "different proposal in this conversation yet."
+            )
+
+        if self._is_cancellation(user_message):
+            self.approval_drafts.set_status(
+                conversation_id,
+                "cancelled",
+            )
+            return "The approval draft has been cancelled. No request was submitted."
+
+        fields = draft["fields"]
+
+        if self._is_confirmation(user_message):
+            if status != "awaiting_confirmation":
+                return (
+                    "The proposal is not ready for submission yet. "
+                    "Please provide the missing trade details first."
+                )
+
+            try:
+                validate_trade_fields(fields)
+            except ValueError as exc:
+                return f"The proposal is incomplete or invalid: {exc}"
+
+            return self._submit_approval_draft(
+                conversation_id,
+                draft,
+            )
+
+        extracted = parse_trade_fields(user_message)
+
+        if extracted:
+            fields.update(extracted)
+
+        missing = missing_trade_fields(fields)
+
+        if missing:
+            self.approval_drafts.update(
+                conversation_id,
+                fields,
+                "collecting",
+            )
+
+            return (
+                "I am collecting the proposed trade details for human "
+                "approval.\n\n"
+                "Still required:\n"
+                + "\n".join(f"- {field}" for field in missing)
+                + "\n\n"
+                "Provide the fields using the format `Field: Value`. "
+                "You can provide multiple fields in one message. "
+                "Reply CANCEL to discard the draft."
+            )
+
+        try:
+            validate_trade_fields(fields)
+        except ValueError as exc:
+            self.approval_drafts.update(
+                conversation_id,
+                fields,
+                "collecting",
+            )
+            return (
+                f"Please correct the trade details: {exc}\n"
+                "You can send the corrected field using `Field: Value`."
+            )
+
+        self.approval_drafts.update(
+            conversation_id,
+            fields,
+            "awaiting_confirmation",
+        )
+
+        return self._format_trade_proposal(fields)
+
 
     def reply(
         self,
@@ -140,6 +499,30 @@ class LLMService:
         """Answer a message using skills, guardrails, MCP, optional RAG, and memory."""
         # Validate before storing or retrieving content derived from the input.
         user_message = validate_user_input(user_message)
+
+# Handle an active approval draft before normal keyword-based skill
+# selection. This preserves the approval workflow across turns.
+        approval_response = self._handle_approval_draft(
+            conversation_id,
+            user_message,
+        )
+
+        if approval_response is not None:
+            self.memory.add_message(
+                conversation_id,
+                "user",
+                user_message,
+            )
+
+            approval_response = validate_assistant_output(approval_response)
+
+            self.memory.add_message(
+                conversation_id,
+                "assistant",
+                approval_response,
+            )
+
+            return approval_response
 
         skill_selection = self.skill_registry.select(user_message)
 
@@ -389,8 +772,7 @@ Knowledge retrieval instructions:
                 if tool_definitions:
                     request_arguments["tools"] = tool_definitions
                     request_arguments["tool_choice"] = "auto"
-                else:
-                    request_arguments["tool_choice"] = "none"
+                 
 
                 response = self._client.chat.completions.create(
                     **request_arguments

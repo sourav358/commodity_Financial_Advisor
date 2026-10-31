@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -6,6 +5,7 @@ from dataclasses import dataclass
 
 QUOTE_TOOL = "get_mcx_quote"
 CALCULATION_TOOL = "calculate_mcx_contract_value"
+APPROVAL_TOOL = "request_human_approval"
 
 
 @dataclass(frozen=True)
@@ -36,14 +36,12 @@ class SkillSelection:
             )
 
         sections = []
-
         for skill in self.skills:
             sections.append(
                 f"Skill: {skill.name}\n"
                 f"Purpose: {skill.description}\n"
                 f"Instructions: {skill.instructions}"
             )
-
         return "\n\n".join(sections)
 
 
@@ -131,34 +129,59 @@ class SkillRegistry:
                 ),
                 allowed_tools=frozenset({QUOTE_TOOL}),
             ),
+            Skill(
+                name="approval_workflow",
+                description="Submit a proposed financial action for human review.",
+                keywords=(
+                    "request approval",
+                    "request human approval",
+                    "submit for approval",
+                    "for approval",
+                    "for human approval",
+                    "send for approval",
+                    "approval request",
+                    "human review",
+                    "seek approval",
+                    "trade approval",
+                    "approve this trade",
+                    "approve this action",
+                    "risk limit approval",
+                    "portfolio rebalance approval",
+                    "trade_execution_request",
+                    "trade execution request",
+                    "execution request",
+                ),
+                instructions=(
+                    "Use request_human_approval only when the user explicitly "
+                    "asks to submit a specific proposed action for human review. "
+                    "Do not invent missing action details or payload values. "
+                    "The tool creates a PENDING review request only; it does "
+                    "not execute, place, amend, or cancel a trade. Explain that "
+                    "a human must review the request using the application CLI."
+                ),
+                allowed_tools=frozenset({APPROVAL_TOOL}),
+            ),
         )
 
     def list_skills(self) -> tuple[Skill, ...]:
         return self._skills
 
     def get_skill(self, name: str) -> Skill | None:
-        return next(
-            (skill for skill in self._skills if skill.name == name),
-            None,
-        )
+        return next((skill for skill in self._skills if skill.name == name), None)
 
     def select(self, user_message: str) -> SkillSelection:
         """Select matching skills and combine their tool permissions."""
         normalized = user_message.casefold()
-
         selected = [
             skill
             for skill in self._skills
-            if any(
-                keyword in normalized
-                for keyword in skill.keywords
-            )
+            if any(keyword in normalized for keyword in skill.keywords)
         ]
-
-        allowed_tools = frozenset().union(
-            *(skill.allowed_tools for skill in selected)
-        ) if selected else frozenset()
-
+        allowed_tools = (
+            frozenset().union(*(skill.allowed_tools for skill in selected))
+            if selected
+            else frozenset()
+        )
         return SkillSelection(
             skills=tuple(selected),
             allowed_tools=allowed_tools,

@@ -32,6 +32,11 @@ from commodity_finance_assistance.tools.mcx_importer import (
 )
 from commodity_finance_assistance.rag.evaluation import RAGEvaluator
 from data.knowledge.evaluation_dataset import RAG_EVALUATION_CASES
+from commodity_finance_assistance.hitl.console import (
+    handle_approvals,
+    handle_approve,
+    handle_reject,
+)
 
 
 DEFAULT_KNOWLEDGE_DIRECTORY = Path("data/knowledge")
@@ -571,7 +576,7 @@ def main() -> None:
     "/quote <commodity>, /mcx-import [csv_path], "
     "/mcx <commodity>, /ingest [directory], "
     "/rag-status, /evaluate, "
-    "/mode [general|trader|investor], /new, /exit"
+    "/mode [general|trader|investor], /new, /exit,/approvals, /approve <request_id> <approver_id> [reason],/reject <request_id> <approver_id> <reason>"
     )
     print(f"Active mode: {active_mode.upper()}")
     print(f"Active conversation ID: {conversation_id}")
@@ -669,6 +674,26 @@ def main() -> None:
                 requested_mode = (
                     user_input.split(maxsplit=1)[1].strip().lower()
                 )
+            if command == "/approvals":
+                handle_approvals()
+                continue
+            if command == "/approve" or command.startswith("/approve "):
+                parts = user_input.split(maxsplit=3)
+                if len(parts) < 3:
+                    print("Usage: /approve <request_id> <approver_id> [reason]")
+                    continue
+
+                reason = parts[3] if len(parts) == 4 else "Approved via local CLI."
+                handle_approve(parts[1], parts[2], reason)
+                continue
+            if command == "/reject" or command.startswith("/reject "):
+                parts = user_input.split(maxsplit=3)
+                if len(parts) < 4:
+                    print("Usage: /reject <request_id> <approver_id> <reason>")
+                    continue
+
+                handle_reject(parts[1], parts[2], parts[3])
+                continue
 
                 try:
                     get_mode_instruction(requested_mode)

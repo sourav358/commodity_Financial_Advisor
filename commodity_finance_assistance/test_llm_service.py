@@ -2,6 +2,7 @@
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+from uuid import uuid4
 
 from commodity_finance_assistance.llm.service import LLMService
 
@@ -49,8 +50,9 @@ class TestLLMService(unittest.TestCase):
         mock_load_config.return_value = {
             "memory": {"conversation": {"max_messages": 20}}
         }
+        conversation_id = f"llm-test-{uuid4()}"
 
-        answer = self.service.reply("conversation-1", "Analyze gold")
+        answer = self.service.reply(conversation_id, "Analyze gold")
 
         self.assertEqual(answer, "Gold analysis response")
         self.client.chat.completions.create.assert_called_once()
@@ -60,10 +62,10 @@ class TestLLMService(unittest.TestCase):
         self.assertEqual(call["temperature"], 0.2)
 
         self.memory.add_message.assert_any_call(
-            "conversation-1", "user", "Analyze gold"
+            conversation_id, "user", "Analyze gold"
         )
         self.memory.add_message.assert_any_call(
-            "conversation-1", "assistant", "Gold analysis response"
+            conversation_id, "assistant", "Gold analysis response"
         )
 
     def test_empty_message_is_rejected(self):
