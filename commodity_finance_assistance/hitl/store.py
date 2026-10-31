@@ -271,6 +271,7 @@ class SQLiteApprovalStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    
     def _transition(
         self,
         request_id: str,
@@ -283,102 +284,165 @@ class SQLiteApprovalStore:
     ) -> ApprovalRequest:
         now = _utc_now()
         expired = False
-        error: Exception | None = None
         result: ApprovalRequest | None = None
 
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
+
             row = connection.execute(
                 "SELECT * FROM hitl_approval_requests WHERE request_id = ?",
                 (request_id,),
             ).fetchone()
+
             if row is None:
-                raise ApprovalNotFoundError(f"Approval request not found: {request_id}")
+                raise ApprovalNotFoundError(
+                    f"Approval request not found: {request_id}"
+                )
 
             current = self._to_model(row)
-            if forbid_requester and actor_id == current.requester_id:
-                raise ApprovalPermissionError("The requester cannot approve or reject their own request.")
 
-            if current.status is not ApprovalStatus.PENDING and target in {
-                ApprovalStatus.APPROVED, ApprovalStatus.REJECTED
-            }:
-                raise InvalidApprovalTransitionError(
-                    f"Cannot change a {current.status.value} request to {target.value}."
+            if forbid_requester and actor_id == current.requester_id:
+                raise ApprovalPermissionError(
+                    "The requester cannot approve or reject their own request."
                 )
-            if target is ApprovalStatus.CONSUMED and current.status is not ApprovalStatus.APPROVED:
-                raise InvalidApprovalTransitionError("Only approved requests can be consumed.")
 
             expiry = datetime.fromisoformat(current.expires_at)
-            if expiry <= now:
+
+            # Expiration takes precedence over normal transition validation.
+            if (
+                current.status in{
+                    ApprovalStatus.PENDING,
+                    ApprovalStatus.APPROVED,
+                }
+                and expiry <= now
+            ):
                 connection.execute(
-                    "UPDATE hitl_approval_requests SET status = 'EXPIRED' WHERE request_id = ?",
+                    """
+                    UPDATE hitl_approval_requests
+                    SET status = 'EXPIRED'
+                    WHERE request_id = ?
+                    """,
                     (request_id,),
                 )
+
                 connection.execute(
-                    """INSERT INTO hitl_approval_events
-                       (request_id, event_type, actor_id, reason, event_at)
-                       VALUES (?, 'EXPIRED', ?, 'Approval request expired', ?)""",
+                    """
+                    INSERT INTO hitl_approval_events
+                        (request_id, event_type, actor_id, reason, event_at)
+                    VALUES (?, 'EXPIRED', ?, 'Approval request expired', ?)
+                    """,
                     (request_id, actor_id, now.isoformat()),
                 )
+
                 expired = True
+
             else:
-                if expected_payload is not None and _payload_hash(expected_payload) != current.payload_hash:
+                # Validate the requested state transition.
+                if (
+                    current.status is not ApprovalStatus.PENDING
+                    and target in {
+                        ApprovalStatus.APPROVED,
+                        ApprovalStatus.REJECTED,
+                    }
+                ):
+                    raise InvalidApprovalTransitionError(
+                        "Only pending requests can be approved or rejected."
+                    )
+
+                if (
+                    target is ApprovalStatus.CONSUMED
+                    and current.status is not ApprovalStatus.APPROVED
+                ):
+                    raise InvalidApprovalTransitionError(
+                        "Only approved requests can be consumed."
+                    )
+
+                # Verify that the payload matches the approved payload.
+                if (
+                    expected_payload is not None
+                    and _payload_hash(expected_payload) != current.payload_hash
+                ):
                     raise ApprovalPayloadMismatchError(
                         "The action payload differs from the approved payload."
                     )
 
                 if target is ApprovalStatus.APPROVED:
                     connection.execute(
-                        """UPDATE hitl_approval_requests
-                           SET status = 'APPROVED', approver_id = ?,
-                               decision_reason = ?, decided_at = ?
-                           WHERE request_id = ? AND status = 'PENDING'""",
+                        """
+                        UPDATE hitl_approval_requests
+                        SET status = 'APPROVED',
+                            approver_id = ?,
+                            decision_reason = ?,
+                            decided_at = ?
+                        WHERE request_id = ? AND status = 'PENDING'
+                        """,
                         (actor_id, reason, now.isoformat(), request_id),
                     )
                     event_type = "APPROVED"
+
                 elif target is ApprovalStatus.REJECTED:
                     connection.execute(
-                        """UPDATE hitl_approval_requests
-                           SET status = 'REJECTED', approver_id = ?,
-                               decision_reason = ?, decided_at = ?
-                           WHERE request_id = ? AND status = 'PENDING'""",
+                        """
+                        UPDATE hitl_approval_requests
+                        SET status = 'REJECTED',
+                            approver_id = ?,
+                            decision_reason = ?,
+                            decided_at = ?
+                        WHERE request_id = ? AND status = 'PENDING'
+                        """,
                         (actor_id, reason, now.isoformat(), request_id),
                     )
                     event_type = "REJECTED"
+
                 elif target is ApprovalStatus.CONSUMED:
                     connection.execute(
-                        """UPDATE hitl_approval_requests
-                           SET status = 'CONSUMED', consumed_at = ?
-                           WHERE request_id = ? AND status = 'APPROVED'""",
+                        """
+                        UPDATE hitl_approval_requests
+                        SET status = 'CONSUMED',
+                            consumed_at = ?
+                        WHERE request_id = ? AND status = 'APPROVED'
+                        """,
                         (now.isoformat(), request_id),
                     )
                     event_type = "CONSUMED"
+
                 else:
-                    raise InvalidApprovalTransitionError(f"Unsupported target state: {target}")
+                    raise InvalidApprovalTransitionError(
+                        f"Unsupported target state: {target}"
+                    )
 
                 connection.execute(
-                    """INSERT INTO hitl_approval_events
-                       (request_id, event_type, actor_id, reason, event_at)
-                       VALUES (?, ?, ?, ?, ?)""",
+                    """
+                    INSERT INTO hitl_approval_events
+                        (request_id, event_type, actor_id, reason, event_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
                     (request_id, event_type, actor_id, reason, now.isoformat()),
                 )
+
                 updated = connection.execute(
                     "SELECT * FROM hitl_approval_requests WHERE request_id = ?",
                     (request_id,),
                 ).fetchone()
+
                 result = self._to_model(updated)
+
             connection.commit()
+
         except Exception:
             connection.rollback()
             raise
+
         finally:
             connection.close()
 
         if expired:
             raise ApprovalExpiredError("Approval request has expired.")
+
         assert result is not None
         return result
+
 
     def approve(
         self, request_id: str, approver_id: str, reason: str | None = None, *,
