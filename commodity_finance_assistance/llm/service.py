@@ -100,14 +100,15 @@ class LLMService:
 
         return conversation_id
 
-    def _retrieve_rag_context(
+    def _retrieve_rag_context_with_status(
         self,
         user_message: str,
         conversation_id: str,
-    ) -> str | None:
-        """Retrieve and format relevant reference material, when enabled."""
+    ) -> tuple[str | None, str]:
+        """Retrieve reference context and report the retrieval outcome."""
+
         if self.rag_query_service is None:
-            return None
+            return None, "disabled"
 
         try:
             results = self.rag_query_service.query(
@@ -116,14 +117,37 @@ class LLMService:
                 min_score=self.rag_min_score,
             )
 
+            if not isinstance(results, list):
+                raise TypeError(
+                    "RAG query service must return a list."
+                )
+
             if not results:
                 logger.info(
                     "RAG returned no references | conversation_id=%s",
                     conversation_id,
                 )
-                return None
+                return None, "no_results"
+
+            if not all(isinstance(item, dict) for item in results):
+                raise TypeError(
+                    "RAG results must contain dictionary records."
+                )
 
             context = self.rag_context_formatter.format_context(results)
+
+            if not isinstance(context, str):
+                raise TypeError(
+                    "RAG context formatter must return a string."
+                )
+
+            if not context.strip():
+                logger.info(
+                    "RAG context was empty after formatting | "
+                    "conversation_id=%s",
+                    conversation_id,
+                )
+                return None, "empty_context"
 
             logger.info(
                 "RAG references processed | conversation_id=%s | "
@@ -133,20 +157,29 @@ class LLMService:
                 len(context),
             )
 
-            if not context.strip():
-                return None
-
-            return context
+            return context, "available"
 
         except Exception:
-            # Retrieval is optional; an outage must not break ordinary chat.
-            # Do not log document contents, embeddings, or user messages.
+            # Preserve ordinary chat if optional knowledge retrieval fails.
+            # Never log raw user messages, document contents, or embeddings.
             logger.exception(
                 "RAG retrieval failed | conversation_id=%s",
                 conversation_id,
             )
-            return None
-    
+            return None, "failed"
+
+    def _retrieve_rag_context(
+        self,
+        user_message: str,
+        conversation_id: str,
+    ) -> str | None:
+        """Backward-compatible context-only retrieval method."""
+
+        context, _ = self._retrieve_rag_context_with_status(
+            user_message,
+            conversation_id,
+        )
+        return context
     @staticmethod
     def _is_approval_request(message: str) -> bool:
         text = message.casefold()
@@ -566,10 +599,40 @@ class LLMService:
 
         # Retrieve context independently of conversation history so that
         # the current question drives document retrieval.
-        rag_context = self._retrieve_rag_context(
-            user_message=user_message,
-            conversation_id=conversation_id,
+        rag_context, rag_status = (
+            self._retrieve_rag_context_with_status(
+                user_message=user_message,
+                conversation_id=conversation_id,
+            )
         )
+
+        if rag_status == "failed":
+            messages.append({
+                "role": "system",
+                "content": (
+                    "Knowledge retrieval failed for this request. "
+                    "Do not claim that project documents were searched "
+                    "successfully or cite documents that were not retrieved. "
+                    "For document-specific questions, explain that the "
+                    "knowledge retrieval service is temporarily unavailable. "
+                    "You may still answer general questions using your "
+                    "general knowledge, clearly distinguishing it from "
+                    "retrieved evidence."
+                ),
+            })
+
+        elif rag_status in {"no_results", "empty_context"}:
+            messages.append({
+                "role": "system",
+                "content": (
+                    "Knowledge retrieval completed but supplied no usable "
+                    "reference material for this request. Do not invent "
+                    "document citations or claim that a source supports "
+                    "your answer. For document-specific questions, explain "
+                    "that no relevant reference material was available. "
+                    "General educational answers are still permitted."
+                ),
+            })
 
         system_prompt = """
 You are Commodity Finance Assistance, a finance research assistant

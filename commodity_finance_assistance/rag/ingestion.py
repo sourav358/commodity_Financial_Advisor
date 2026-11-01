@@ -1,12 +1,15 @@
-
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
 
-from commodity_finance_assistance.rag.chunker import chunk_document
+from commodity_finance_assistance.rag.chunker import (
+    DocumentChunk,
+    chunk_document,
+)
 from commodity_finance_assistance.rag.document_loader import (
     SUPPORTED_EXTENSIONS,
+    Document,
     load_document,
 )
 from commodity_finance_assistance.rag.store import RAGStore
@@ -40,8 +43,11 @@ class RAGIngestionService:
         self.chunk_size = chunk_size
         self.overlap = overlap
 
-    def ingest_file(self, path: str | Path) -> IngestionResult:
-        """Load, chunk, and persist one supported document."""
+    def prepare_file(
+        self,
+        path: str | Path,
+    ) -> tuple[Document, list[DocumentChunk]]:
+        """Load and chunk a document without persisting it."""
         document = load_document(path)
 
         chunks = chunk_document(
@@ -54,6 +60,12 @@ class RAGIngestionService:
             raise ValueError(
                 f"No chunks were generated for: {Path(path).name}"
             )
+
+        return document, chunks
+
+    def ingest_file(self, path: str | Path) -> IngestionResult:
+        """Load, chunk, and persist one supported document."""
+        document, chunks = self.prepare_file(path)
 
         saved_count = self.store.save_document(document, chunks)
 
@@ -68,7 +80,7 @@ class RAGIngestionService:
         self,
         directory: str | Path,
     ) -> list[IngestionResult]:
-        """Ingest all supported documents under a directory recursively."""
+        """Ingest supported documents recursively."""
         root = Path(directory)
 
         if not root.is_dir():

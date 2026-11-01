@@ -293,6 +293,7 @@ class RAGStore:
 
         if row is None:
             return None
+        return self._decode_embedding(dict(row))
 
         result = dict(row)
         result["embedding"] = json.loads(result.pop("vector_json"))
@@ -327,10 +328,227 @@ class RAGStore:
 
             rows = connection.execute(query, parameters).fetchall()
 
-        results = []
-        for row in rows:
-            result = dict(row)
-            result["embedding"] = json.loads(result.pop("vector_json"))
-            results.append(result)
+        return [
+            self._decode_embedding(dict(row))
+            for row in rows
+        ]
+    @staticmethod
+    def _decode_embedding(row: dict) -> dict:
+        """Decode and validate a persisted embedding record."""
 
-        return results
+        try:
+            vector = json.loads(row.pop("vector_json"))
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise ValueError(
+                f"Corrupted embedding JSON for chunk "
+                f"{row.get('chunk_id')}"
+            ) from exc
+
+        dimensions = row.get("dimensions")
+
+        if (
+            not isinstance(dimensions, int)
+            or isinstance(dimensions, bool)
+            or dimensions <= 0
+        ):
+            raise ValueError(
+                f"Invalid embedding dimensions for "
+                f"{row.get('chunk_id')}"
+            )
+
+        if not isinstance(vector, list) or len(vector) != dimensions:
+            raise ValueError(
+                f"Embedding dimension mismatch for "
+                f"{row.get('chunk_id')}"
+            )
+
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            for value in vector
+        ):
+            raise ValueError(
+                f"Invalid embedding values for "
+                f"{row.get('chunk_id')}"
+            )
+
+        row["embedding"] = [float(value) for value in vector]
+        return row
+    def save_document_with_embeddings(
+        self,
+        document: Document,
+        chunks: list[DocumentChunk],
+        embeddings: dict[str, list[float]],
+        model: str,
+        dimensions: int,
+    ) -> int:
+        """Atomically replace a document, its chunks, and their embeddings."""
+
+        if not chunks:
+            raise ValueError("At least one chunk is required")
+
+        if not isinstance(model, str) or not model.strip():
+            raise ValueError("Embedding model must not be empty")
+
+        if (
+            not isinstance(dimensions, int)
+            or isinstance(dimensions, bool)
+            or dimensions <= 0
+        ):
+            raise ValueError("Embedding dimensions must be a positive integer")
+
+        chunk_ids: set[str] = set()
+        chunk_indexes: set[int] = set()
+
+        for chunk in chunks:
+            if chunk.document_id != document.document_id:
+                raise ValueError(
+                    "Every chunk must belong to the supplied document"
+                )
+
+            if not isinstance(chunk.chunk_id, str) or not chunk.chunk_id.strip():
+                raise ValueError("Chunk ID must not be empty")
+
+            if chunk.chunk_id in chunk_ids:
+                raise ValueError("Duplicate chunk IDs are not allowed")
+
+            if (
+                not isinstance(chunk.chunk_index, int)
+                or isinstance(chunk.chunk_index, bool)
+                or chunk.chunk_index < 0
+            ):
+                raise ValueError("Chunk index must be a non-negative integer")
+
+            if chunk.chunk_index in chunk_indexes:
+                raise ValueError("Duplicate chunk indexes are not allowed")
+
+            chunk_ids.add(chunk.chunk_id)
+            chunk_indexes.add(chunk.chunk_index)
+
+        if not isinstance(embeddings, dict):
+            raise TypeError("Embeddings must be a dictionary")
+
+        if set(embeddings) != chunk_ids:
+            raise ValueError(
+                "Embedding IDs must exactly match the supplied chunk IDs"
+            )
+
+        embedding_rows = []
+
+        for chunk_id, vector in embeddings.items():
+            if not isinstance(vector, (list, tuple)):
+                raise ValueError(f"Embedding for {chunk_id} must be a vector")
+
+            if len(vector) != dimensions:
+                raise ValueError(
+                    f"Expected {dimensions} dimensions for {chunk_id}, "
+                    f"received {len(vector)}"
+                )
+
+            if any(isinstance(value, bool) for value in vector):
+                raise ValueError(
+                    f"Embedding for {chunk_id} contains Boolean values"
+                )
+
+            try:
+                normalized = [float(value) for value in vector]
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(
+                    f"Embedding for {chunk_id} contains invalid values"
+                ) from exc
+
+            if not all(math.isfinite(value) for value in normalized):
+                raise ValueError(
+                    f"Embedding for {chunk_id} contains non-finite values"
+                )
+
+            embedding_rows.append(
+                (
+                    chunk_id,
+                    model,
+                    dimensions,
+                    json.dumps(normalized, allow_nan=False),
+                )
+            )
+
+        # All database writes happen in the same transaction.
+        with get_connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO rag_documents (
+                    document_id, source, title, file_type
+                )
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(document_id) DO UPDATE SET
+                    source = excluded.source,
+                    title = excluded.title,
+                    file_type = excluded.file_type,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    document.document_id,
+                    document.source,
+                    document.title,
+                    document.file_type,
+                ),
+            )
+
+            # Remove older document IDs belonging to the same source file.
+            # Their chunks and embeddings are removed through FK cascades.
+            connection.execute(
+                """
+                DELETE FROM rag_documents
+                WHERE source = ?
+                  AND document_id <> ?
+                """,
+                (
+                    document.source,
+                    document.document_id,
+                ),
+            )
+            # Remove existing chunks for this document before inserting
+            # the replacement chunks. Embeddings are removed via FK cascade.
+            connection.execute(
+                """
+                DELETE FROM rag_chunks
+                WHERE document_id = ?
+                """,
+                (document.document_id,),
+            )
+            connection.executemany(
+                """
+                INSERT INTO rag_chunks (
+                    chunk_id,
+                    document_id,
+                    text,
+                    chunk_index,
+                    start_char,
+                    end_char
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        chunk.chunk_id,
+                        chunk.document_id,
+                        chunk.text,
+                        chunk.chunk_index,
+                        chunk.start_char,
+                        chunk.end_char,
+                    )
+                    for chunk in chunks
+                ],
+            )
+
+            connection.executemany(
+                """
+                INSERT INTO rag_embeddings (
+                    chunk_id, model, dimensions, vector_json
+                )
+                VALUES (?, ?, ?, ?)
+                """,
+                embedding_rows,
+            )
+
+        return len(embedding_rows)

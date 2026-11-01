@@ -54,8 +54,10 @@ def load_document(path: str | Path) -> Document:
             f"No extractable text found in: {file_path.name}"
         )
 
+    normalized_source = str(file_path.resolve()).casefold()
+
     document_id = hashlib.sha256(
-        content.encode("utf-8")
+        normalized_source.encode("utf-8")
     ).hexdigest()
 
     return Document(

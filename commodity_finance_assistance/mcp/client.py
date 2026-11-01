@@ -87,12 +87,17 @@ class MCPToolClient:
                 arguments=arguments,
             )
 
-            if result.isError:
+            if getattr(result, "isError", False):
                 logger.warning(
                     "MCP tool returned an error | tool=%s",
                     name,
                 )
 
+                return json.dumps({
+                    "error": "MCP tool reported an execution error.",
+                    "error_type": "MCPToolReportedError",
+                    "retryable": False,
+                })
             structured_content = getattr(
                 result,
                 "structuredContent",

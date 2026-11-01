@@ -177,6 +177,205 @@ class TestRAGStore(unittest.TestCase):
     def test_deleting_missing_document_returns_false(self):
         self.assertFalse(self.store.delete_document("missing-document"))
 
+    def insert_raw_embedding(
+        self,
+        chunk_id,
+        vector_json,
+        dimensions=2,
+        model="text-embedding-3-small",
+    ):
+        """Insert raw embedding data to simulate database corruption."""
+        with self._get_connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO rag_embeddings (
+                    chunk_id, model, dimensions, vector_json
+                )
+                VALUES (?, ?, ?, ?)
+                """,
+                (chunk_id, model, dimensions, vector_json),
+            )
+
+    def test_save_and_retrieve_embeddings(self):
+        document = self.make_document()
+        chunks = self.make_chunks(
+            document,
+            [("ABCDEFGHIJ", 0, 10)],
+        )
+        self.store.save_document(document, chunks)
+
+        saved_count = self.store.save_embeddings(
+            {"doc-1:0": [0.1, 0.2]},
+            model="text-embedding-3-small",
+            dimensions=2,
+        )
+
+        self.assertEqual(saved_count, 1)
+
+        embeddings = self.store.get_embeddings(
+            model="text-embedding-3-small"
+        )
+
+        self.assertEqual(len(embeddings), 1)
+        self.assertEqual(embeddings[0]["chunk_id"], "doc-1:0")
+        self.assertEqual(embeddings[0]["embedding"], [0.1, 0.2])
+        self.assertEqual(embeddings[0]["dimensions"], 2)
+
+    def test_get_embedding_returns_validated_vector(self):
+        document = self.make_document()
+        chunks = self.make_chunks(
+            document,
+            [("ABCDEFGHIJ", 0, 10)],
+        )
+        self.store.save_document(document, chunks)
+
+        self.store.save_embeddings(
+            {"doc-1:0": [0.3, 0.4]},
+            model="test-model",
+            dimensions=2,
+        )
+
+        result = self.store.get_embedding("doc-1:0")
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["embedding"], [0.3, 0.4])
+
+    def test_missing_embedding_returns_none(self):
+        self.assertIsNone(
+            self.store.get_embedding("missing-chunk")
+        )
+
+    def test_missing_embeddings_returns_empty_list(self):
+        self.assertEqual(self.store.get_embeddings(), [])
+
+    def test_corrupted_embedding_json_is_rejected(self):
+        document = self.make_document()
+        chunks = self.make_chunks(
+            document,
+            [("ABCDEFGHIJ", 0, 10)],
+        )
+        self.store.save_document(document, chunks)
+
+        self.insert_raw_embedding(
+            "doc-1:0",
+            "{invalid-json",
+        )
+
+        with self.assertRaisesRegex(ValueError, "Corrupted embedding JSON"):
+            self.store.get_embeddings()
+
+    def test_embedding_dimension_mismatch_is_rejected(self):
+        document = self.make_document()
+        chunks = self.make_chunks(
+            document,
+            [("ABCDEFGHIJ", 0, 10)],
+        )
+        self.store.save_document(document, chunks)
+
+        self.insert_raw_embedding(
+            "doc-1:0",
+            "[0.1, 0.2, 0.3]",
+            dimensions=2,
+        )
+
+        with self.assertRaisesRegex(ValueError, "dimension mismatch"):
+            self.store.get_embeddings()
+
+    def test_non_finite_stored_embedding_is_rejected(self):
+        document = self.make_document()
+        chunks = self.make_chunks(
+            document,
+            [("ABCDEFGHIJ", 0, 10)],
+        )
+        self.store.save_document(document, chunks)
+
+        self.insert_raw_embedding(
+            "doc-1:0",
+            "[0.1, NaN]",
+        )
+
+        with self.assertRaisesRegex(ValueError, "Invalid embedding values"):
+            self.store.get_embeddings()
+
+    def test_boolean_stored_embedding_is_rejected(self):
+        document = self.make_document()
+        chunks = self.make_chunks(
+            document,
+            [("ABCDEFGHIJ", 0, 10)],
+        )
+        self.store.save_document(document, chunks)
+
+        self.insert_raw_embedding(
+            "doc-1:0",
+            "[0.1, true]",
+        )
+
+        with self.assertRaisesRegex(ValueError, "Invalid embedding values"):
+            self.store.get_embeddings()
+
+    def test_deleting_document_also_deletes_embeddings(self):
+        document = self.make_document()
+        chunks = self.make_chunks(
+            document,
+            [("ABCDEFGHIJ", 0, 10)],
+        )
+        self.store.save_document(document, chunks)
+
+        self.store.save_embeddings(
+            {"doc-1:0": [0.1, 0.2]},
+            model="test-model",
+            dimensions=2,
+        )
+
+        self.assertIsNotNone(
+            self.store.get_embedding("doc-1:0")
+        )
+
+        self.assertTrue(
+            self.store.delete_document(document.document_id)
+        )
+
+        self.assertIsNone(
+            self.store.get_embedding("doc-1:0")
+        )
+
+    def test_replacing_chunks_removes_old_embeddings(self):
+        document = self.make_document()
+        original_chunks = self.make_chunks(
+            document,
+            [
+                ("ABCDEF", 0, 6),
+                ("EFGHIJ", 4, 10),
+            ],
+        )
+        self.store.save_document(document, original_chunks)
+
+        self.store.save_embeddings(
+            {
+                "doc-1:0": [0.1, 0.2],
+                "doc-1:1": [0.3, 0.4],
+            },
+            model="test-model",
+            dimensions=2,
+        )
+
+        updated_chunks = self.make_chunks(
+            document,
+            [("ABCDEFGHIJ", 0, 10)],
+        )
+        self.store.save_document(document, updated_chunks)
+
+        self.assertIsNone(
+            self.store.get_embedding("doc-1:0")
+        )
+        self.assertIsNone(
+            self.store.get_embedding("doc-1:1")
+        )
+        self.assertEqual(
+            self.store.get_embeddings(),
+            [],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

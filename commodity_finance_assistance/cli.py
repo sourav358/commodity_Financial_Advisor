@@ -37,6 +37,7 @@ from commodity_finance_assistance.hitl.console import (
     handle_approve,
     handle_reject,
 )
+from commodity_finance_assistance.rag.pipeline import RAGPipeline
 
 
 DEFAULT_KNOWLEDGE_DIRECTORY = Path("data/knowledge")
@@ -100,6 +101,30 @@ def print_history(service: LLMService, conversation_id: str) -> None:
 
     for message in messages:
         print(f"\n{message['role'].upper()}: {message['content']}")
+
+def handle_mode_command(
+    user_input: str,
+    active_mode: str,
+) -> str:
+    """Display or change the active assistant mode."""
+
+    parts = user_input.strip().split(maxsplit=1)
+
+    if len(parts) == 1:
+        print(f"Current mode: {active_mode}")
+        print("Available modes: general, trader, investor")
+        return active_mode
+
+    requested_mode = parts[1].strip().lower()
+
+    try:
+        get_mode_instruction(requested_mode)
+    except ValueError as exc:
+        print(f"Mode error: {exc}")
+        return active_mode
+
+    print(f"Assistant mode changed to: {requested_mode.upper()}")
+    return requested_mode
 
 
 def handle_quote(
@@ -181,10 +206,10 @@ def handle_mcx(user_input: str) -> None:
 
 def handle_ingest(
     user_input: str,
-    ingestion_service: RAGIngestionService,
-    store: RAGStore,
+    pipeline: RAGPipeline,
 ) -> None:
-    """Ingest documents and generate persistent embeddings."""
+    """Ingest documents through the atomic RAG pipeline."""
+
     parts = user_input.split(maxsplit=1)
 
     directory = (
@@ -200,115 +225,30 @@ def handle_ingest(
     try:
         print(f"\nScanning documents in: {directory}")
 
-        results = ingestion_service.ingest_directory(directory)
+        results = pipeline.ingest_directory(directory)
 
         if not results:
             print("No supported documents found.")
             return
 
-        # Create the embedding client only when ingestion is requested.
-        embedding_service = EmbeddingService()
-
-        total_documents = 0
-        total_chunks = 0
-        total_embeddings = 0
-
-        for result in results:
-            chunks = store.get_chunks(result.document_id)
-
-            if not chunks:
-                print(
-                    f"Skipping embedding: no stored chunks for "
-                    f"{result.title}"
-                )
-                continue
-
-            vectors = embedding_service.embed_texts(
-                [chunk["text"] for chunk in chunks]
-            )
-
-            embeddings = {
-                chunk["chunk_id"]: vector
-                for chunk, vector in zip(
-                    chunks,
-                    vectors,
-                    strict=True,
-                )
-            }
-
-            saved_count = store.save_embeddings(
-                embeddings=embeddings,
-                model=embedding_service.model,
-                dimensions=embedding_service.dimensions,
-            )
-
-            total_documents += 1
-            total_chunks += len(chunks)
-            total_embeddings += saved_count
-
-            print(
-                f"Indexed: {result.title} | "
-                f"Chunks: {len(chunks)} | "
-                f"Embeddings: {saved_count}"
-            )
+        total_chunks = sum(result.chunk_count for result in results)
 
         print("\nDocument ingestion completed.")
-        print(f"Documents processed: {total_documents}")
+        print(f"Documents processed: {len(results)}")
         print(f"Chunks processed: {total_chunks}")
-        print(f"Embeddings saved: {total_embeddings}")
-        print(f"Embedding model: {embedding_service.model}")
+        print(f"Embeddings saved: {total_chunks}")
+        print(f"Embedding model: {pipeline.embedding_service.model}")
+
+        for result in results:
+            print(
+                f"Indexed: {result.title} | "
+                f"Chunks: {result.chunk_count}"
+            )
 
     except Exception as exc:
         print(
-            f"RAG ingestion error: {type(exc).__name__}: {exc}"
+            f"\nRAG ingestion error: {type(exc).__name__}: {exc}"
         )
-
-
-def handle_rag_status(store: RAGStore) -> None:
-    """Display the current RAG database statistics."""
-    try:
-        with get_connection() as connection:
-            documents = connection.execute(
-                "SELECT COUNT(*) FROM rag_documents"
-            ).fetchone()[0]
-
-            chunks = connection.execute(
-                "SELECT COUNT(*) FROM rag_chunks"
-            ).fetchone()[0]
-
-            embeddings = connection.execute(
-                "SELECT COUNT(*) FROM rag_embeddings"
-            ).fetchone()[0]
-
-            models = connection.execute(
-                """
-                SELECT DISTINCT model
-                FROM rag_embeddings
-                ORDER BY model
-                """
-            ).fetchall()
-
-        print("\nRAG Knowledge Base Status")
-        print(f"Documents: {documents}")
-        print(f"Chunks: {chunks}")
-        print(f"Embeddings: {embeddings}")
-
-        if models:
-            print("Embedding models:")
-            for model in models:
-                print(f"  - {model['model']}")
-        else:
-            print("Embedding models: None")
-
-        if chunks > embeddings:
-            print(
-                "\nWarning: Some chunks do not have embeddings. "
-                "Run /ingest again."
-            )
-
-    except sqlite3.Error as exc:
-        print(f"RAG status error: {exc}")
-
 
 def handle_evaluate(rag_query_service) -> None:
     """Run RAG retrieval evaluation and display the results."""
@@ -547,6 +487,10 @@ def main() -> None:
     rag_store.initialize_schema()
 
     ingestion_service = RAGIngestionService(store=rag_store)
+    rag_pipeline = RAGPipeline(
+        ingestion_service=ingestion_service,
+        store=rag_store,
+    )
 
     # RAG query embeddings are initialized lazily.
     rag_query_service = LazyRAGQueryService(rag_store)
@@ -653,8 +597,8 @@ def main() -> None:
             if command == "/ingest" or command.startswith("/ingest "):
                 handle_ingest(
                     user_input,
-                    ingestion_service,
-                    rag_store,
+                    rag_pipeline
+ ,
                 )
                 continue
 
@@ -665,36 +609,50 @@ def main() -> None:
                 handle_evaluate(rag_query_service)
                 continue
 
-            if command == "/mode":
-                print(f"Current mode: {active_mode}")
-                print("Available modes: general, trader, investor")
+            # Assistant mode commands
+            if command == "/mode" or command.startswith("/mode "):
+                active_mode = handle_mode_command(
+                    user_input,
+                    active_mode,
+                )
                 continue
 
-            if command.startswith("/mode "):
-                requested_mode = (
-                    user_input.split(maxsplit=1)[1].strip().lower()
-                )
+            # Human-in-the-loop approval commands
             if command == "/approvals":
                 handle_approvals()
                 continue
+
             if command == "/approve" or command.startswith("/approve "):
                 parts = user_input.split(maxsplit=3)
+
                 if len(parts) < 3:
-                    print("Usage: /approve <request_id> <approver_id> [reason]")
+                    print(
+                        "Usage: /approve "
+                        "<request_id> <approver_id> [reason]"
+                    )
                     continue
 
-                reason = parts[3] if len(parts) == 4 else "Approved via local CLI."
+                reason = (
+                    parts[3]
+                    if len(parts) == 4
+                    else "Approved via local CLI."
+                )
+
                 handle_approve(parts[1], parts[2], reason)
                 continue
+
             if command == "/reject" or command.startswith("/reject "):
                 parts = user_input.split(maxsplit=3)
+
                 if len(parts) < 4:
-                    print("Usage: /reject <request_id> <approver_id> <reason>")
+                    print(
+                        "Usage: /reject "
+                        "<request_id> <approver_id> <reason>"
+                    )
                     continue
 
                 handle_reject(parts[1], parts[2], parts[3])
                 continue
-
                 try:
                     get_mode_instruction(requested_mode)
                 except ValueError as exc:
